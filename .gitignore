@@ -1,0 +1,18 @@
+# OS
+.DS_Store
+
+# 构建产物
+build/
+*.apk
+*.aab
+
+# Flutter / Android（后续源码入库时使用）
+.dart_tool/
+.packages
+.flutter-plugins*
+local.properties
+key.properties
+*.jks
+
+# 敏感与临时
+*.log
