@@ -17,3 +17,18 @@
 - [ ] 协议审计:agentConversationTransport.ts(629行) 对照 zflow protocol/,
       补 conversationWorkflowRuns* / queryConversationCommandsV4
 - [ ] 重连可靠性:对照 agentV4ConnectionHandshake.ts / workspaceConnectionRegistry.ts
+
+## v4 UI 还原进行中(官方源码提取记录)
+- composer 主结构:ConversationComposer.tsx L1700+ dock = flex 纵向列,
+  附件行在上、工具栏在下;进度环用 -rotate-90 SVG stroke-border。
+- 模型触发(modelTriggerDisplay):结构化 {fullLabel, providerPrefix?, modelLabel},
+  窄屏可按密度隐藏 provider 前缀 —— zflow 药丸已符合,补前缀逻辑即可。
+- 工具栏含 quota/upgrade 入口(chat.toolbar.model.label)。
+- 待办:V4ComposerToolbar.tsx 1096 行逐段映射到 composer.dart;
+  ConversationHeader 是窗格 chrome,手机顶栏在别处继续找。
+
+## 用户决策记录
+- v4 路线确认:ZcodeMini-App(Flutter,zflow 协议层)为基座,
+  UI 按官方源码重做;协议审计结论见 protocol-capability-audit.md。
+- 用户要的功能:新建会话✓(zflow draft)、打开文件夹(待加)、
+  多设备(✓ zflow 连接池,无交接制需要!)、通知(✓ zflow task_notifier)。
