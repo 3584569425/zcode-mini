@@ -32,3 +32,14 @@
   UI 按官方源码重做;协议审计结论见 protocol-capability-audit.md。
 - 用户要的功能:新建会话✓(zflow draft)、打开文件夹(待加)、
   多设备(✓ zflow 连接池,无交接制需要!)、通知(✓ zflow task_notifier)。
+
+## UI 调试闭环(已验证可用)
+安卓模拟器本机未装(无 emulator/系统镜像);改用 Web 调试路线:
+1. cd ZcodeMini-App && flutter build web --release
+2. python3 -m http.server 8200 -d build/web
+3. 浏览器(iab)开 http://localhost:8200,视口 390x844
+4. Flutter Web 是 canvas 渲染:DOM 快照无效,用 cua.click 坐标点击 + 截图验证
+   (点击若无效,确认无遮挡后重试;坐标按逻辑像素)
+5. 已通过 Web 端完整协议连上真实桌面(YOLO 条/用量条/模型药丸全活数据)
+6. 迭代:改 Flutter 代码 → flutter build web → reload → 截图对比
+注意:已移除 fork 对上游 zflow 的启动更新检查(会弹无关更新框)。
