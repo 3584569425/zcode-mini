@@ -43,3 +43,11 @@
 5. 已通过 Web 端完整协议连上真实桌面(YOLO 条/用量条/模型药丸全活数据)
 6. 迭代:改 Flutter 代码 → flutter build web → reload → 截图对比
 注意:已移除 fork 对上游 zflow 的启动更新检查(会弹无关更新框)。
+
+## V4ComposerToolbar 设计规格(已提取,映射到 composer.dart)
+- 模型触发:fullLabel + providerPrefix(紧凑断点隐藏前缀);极窄=28px 纯图标模式
+- **思考档是循环按钮**(ThoughtLevelCycleControl):点一下循环下一档,非菜单 — zflow 需改
+- 模型菜单不可用态:加载失败重试按钮 / remoteWaiting / targetMissing 三种文案
+- ChatContextUsage 在工具栏上方独立一行
+- zflow 对应改法:思考药丸 onClick 循环 state.thoughtLevels 下一档(optimisticPatch),
+  模型药丸保持弹层
