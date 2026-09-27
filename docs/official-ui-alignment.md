@@ -51,3 +51,16 @@
 - ChatContextUsage 在工具栏上方独立一行
 - zflow 对应改法:思考药丸 onClick 循环 state.thoughtLevels 下一档(optimisticPatch),
   模型药丸保持弹层
+
+## 思考循环已实现(待真机/浏览器复核)
+- chat_page.dart 新增 _cycleThought():点思考药丸循环 thoughtLevels 下一档,
+  optimisticPatch 乐观更新 + switchModelConfig 提交;无档位回落思考菜单。
+- 已通过 analyze(0 issue)+ web 构建。
+## 浏览器调试坐标教训
+- cua 坐标 = 截图逻辑像素 1:1,但页面可滚动导致同坐标不同元素;
+  每次点击前必须先截图确认目标当前位置,不要凭记忆。
+- 对话 Tab 底栏图标在 y≈790(设置页滚动态),主页 y≈820;注意区分。
+## 待续
+1. 浏览器里回到对话页(返回箭头→底栏对话),点击思考药丸验证循环
+2. 顶栏/会话列表对照官方重做
+3. Flutter 端 Android 构建发布(协议+通知全在,随 UI 一起发)
