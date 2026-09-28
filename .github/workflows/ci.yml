@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  analyze-and-test:
+    name: Flutter analyze + test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          # Pinned to the verified toolchain (.flutter-version); a floating
+          # stable channel silently moves CI off the tested SDK.
+          flutter-version: 3.47.0
+          cache: true
+
+      - name: Set up Java 17
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Run unit tests
+        run: flutter test --coverage
+
+      # Baseline only for now: per-layer thresholds come later. The report
+      # is uploaded so regressions are visible without a local run.
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-lcov
+          path: coverage/lcov.info
+          if-no-files-found: error
+
+      # Compile smoke: catches breaking API changes in dependencies that
+      # `flutter analyze` misses (e.g. file_picker v12's changed return
+      # types) — those only surface at build time.
+      - name: Compile smoke (web)
+        run: flutter build web --release
+
+      # PR/main Android smoke: a debug arm64 APK compiles the full Android
+      # embedding without paying release/R8 cost. The release APK workflow
+      # stays tag/manual-gated.
+      - name: Compile smoke (Android)
+        run: flutter build apk --debug --target-platform android-arm64

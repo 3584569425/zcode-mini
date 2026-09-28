@@ -1,0 +1,119 @@
+name: Build APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build release APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Third-party actions are pinned to full commit SHAs: this workflow
+      # holds the release keystore, so a hijacked tag must not be able to
+      # swap an action for modified code.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          # Pinned to the verified toolchain (.flutter-version), matching CI.
+          flutter-version: 3.47.0
+          cache: true
+
+      - name: Set up Java 17
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Run unit tests
+        run: flutter test
+
+      # Restore the release keystore from GitHub Secrets so CI-built APKs
+      # share the same signature as local builds (overwrite-install works).
+      - name: Set up release signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > android/app/zemote-release.jks
+            echo "ANDROID_STOREFILE=zemote-release.jks" >> "$GITHUB_ENV"
+            echo "ANDROID_STOREPASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "ANDROID_KEYPASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "ANDROID_KEYALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "HAS_RELEASE_KEYSTORE=true" >> "$GITHUB_ENV"
+            echo "Release signing configured from secrets."
+          else
+            echo "HAS_RELEASE_KEYSTORE=false" >> "$GITHUB_ENV"
+            echo "WARN: ANDROID_KEYSTORE_BASE64 secret missing; APK will use debug signing and will not be published."
+          fi
+
+      # arm64-only release artifact (~1/3 the size of the fat APK; 32-bit
+      # and x86 devices must build locally without --target-platform).
+      # APP_VERSION is injected so pubspec.yaml is the single version source.
+      - name: Extract version
+        run: echo "VERSION=$(awk -F'[ +]' '/^version:/ {print $2}' pubspec.yaml)" >> "$GITHUB_ENV"
+
+      - name: Build APK (release)
+        run: |
+          echo "building v$VERSION"
+          flutter build apk --release \
+            --target-platform android-arm64 \
+            --dart-define=APP_VERSION=$VERSION
+
+      # The app verifies this checksum before handing a downloaded APK to
+      # the installer (see lib/update/update_dialog.dart).
+      - name: Generate SHA-256 checksum
+        run: |
+          cd build/app/outputs/flutter-apk
+          mv app-release.apk "Zcode.mini-$VERSION-arm64.apk"
+          sha256sum "Zcode.mini-$VERSION-arm64.apk" > "Zcode.mini-$VERSION-arm64.apk.sha256"
+          cat "Zcode.mini-$VERSION-arm64.apk.sha256"
+
+      # Manual dispatches build but never publish — publishing requires a tag.
+      # Release body carries the matching CHANGELOG section so the in-app
+      # update dialog can show what's new.
+      - name: Extract changelog for release body
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v section="## [$VERSION]" '
+            index($0, section)==1 {found=1; next}
+            found && /^## /{exit}
+            found {print}
+          ' CHANGELOG.md > release_body.md
+          if [ ! -s release_body.md ]; then
+            echo "Zcode mini ${{ github.ref_name }}" > release_body.md
+          fi
+          {
+            cat release_body.md
+            printf '\n---\n\n> APK 由 GitHub Actions 从标签 `%s` 自动构建，SHA-256 见附件。\n' "$GITHUB_REF_NAME"
+          } > release_body_final.md
+
+      - name: Upload APK to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') && env.HAS_RELEASE_KEYSTORE == 'true'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            build/app/outputs/flutter-apk/Zcode.mini-${{ env.VERSION }}-arm64.apk
+            build/app/outputs/flutter-apk/Zcode.mini-${{ env.VERSION }}-arm64.apk.sha256
+          name: ${{ github.ref_name }}
+          body_path: release_body_final.md
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true

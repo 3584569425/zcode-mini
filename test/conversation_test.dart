@@ -1,0 +1,1354 @@
+import 'dart:async';
+import 'dart:typed_data';
+
+import 'package:flutter_test/flutter_test.dart';
+
+import 'package:zflow/protocol/channel_client.dart';
+import 'package:zflow/protocol/conversation.dart';
+import 'package:zflow/protocol/ipc_codec.dart';
+import 'package:zflow/protocol/zflow_client.dart';
+
+Uint8List _conversationFrame(List<Object?> header, [Object? data]) {
+  final writer = ValueWriter();
+  encodeValue(writer, header);
+  if (data != null) encodeValue(writer, data);
+  return writer.toBytes();
+}
+
+({int id, String method, Object? args}) _conversationRequest(Uint8List body) {
+  final reader = ValueReader(body);
+  final header = decodeValue(reader) as List;
+  return (
+    id: (header[1] as num).toInt(),
+    method: header[3] as String,
+    args: decodeValue(reader),
+  );
+}
+
+void _respondConversation(ChannelClient channels, int id, Object? result) {
+  channels.handleMessage(
+      _conversationFrame([ChannelClient.resPromiseSuccess, id], result));
+}
+
+void _rejectConversation(ChannelClient channels, int id, Object? error) {
+  channels.handleMessage(
+      _conversationFrame([ChannelClient.resPromiseError, id], error));
+}
+
+Future<void> _flushConversation() => Future<void>.delayed(Duration.zero);
+
+
+void main() {
+  group('ConversationState delta application', () {
+    late ConversationState state;
+
+    setUp(() {
+      state = ConversationState();
+    });
+
+    test('snapshot clears and replaces state', () {
+      state.applyFrame({
+        'payload': {
+          'kind': 'snapshot',
+          'snapshot': {
+            'logEpoch': 'epoch-1',
+            'revision': 5,
+            'rows': {
+              'window': [
+                {'rowId': 1, 'kind': 'user', 'text': 'hello'},
+                {'rowId': 2, 'kind': 'assistant', 'text': 'hi'},
+              ],
+              'totalCount': 2,
+              'firstRowId': 1,
+            },
+          },
+        },
+        'toSeq': 10,
+      }, onGap: () => fail('should not gap on snapshot'));
+
+      expect(state.rows, hasLength(2));
+      expect(state.rows[0]['text'], 'hello');
+      expect(state.seq, 10);
+      expect(state.logEpoch, 'epoch-1');
+      expect(state.revision, 5);
+      expect(state.firstRowId, 1);
+      expect(state.totalCount, 2);
+      expect(state.ready, isTrue);
+    });
+
+    test('row.appended adds to end', () {
+      _injectSnapshot(state, seq: 1);
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'row.appended', 'row': {'rowId': 99, 'kind': 'user', 'text': 'new'}},
+          ],
+        },
+        'fromSeq': 1,
+        'toSeq': 2,
+      }, onGap: () => fail('should not gap'));
+
+      expect(state.rows, hasLength(1));
+      expect(state.rows[0]['rowId'], 99);
+      expect(state.seq, 2);
+      expect(state.totalCount, 1);
+    });
+
+    test('row.upserted replaces existing row', () {
+      _injectSnapshot(state, rows: [
+        {'rowId': 1, 'kind': 'user', 'text': 'old'},
+      ]);
+
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'row.upserted', 'row': {'rowId': 1, 'kind': 'user', 'text': 'updated'}},
+          ],
+        },
+        'fromSeq': 5,
+        'toSeq': 6,
+      }, onGap: () => fail('should not gap'));
+
+      expect(state.rows, hasLength(1));
+      expect(state.rows[0]['text'], 'updated');
+    });
+
+    test('row.removed removes from rowId upward', () {
+      _injectSnapshot(state, rows: [
+        {'rowId': 1, 'kind': 'user', 'text': 'a'},
+        {'rowId': 2, 'kind': 'assistant', 'text': 'b'},
+        {'rowId': 3, 'kind': 'user', 'text': 'c'},
+      ], totalCount: 3);
+
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'row.removed', 'fromRowId': 2},
+          ],
+        },
+        'fromSeq': 5,
+        'toSeq': 6,
+      }, onGap: () => fail('should not gap'));
+
+      expect(state.rows, hasLength(1));
+      expect(state.rows[0]['rowId'], 1);
+      // totalCount was 3, 2 rows removed (rowId>=2), so remaining = 1
+      // clamp: (3-2).clamp(0, 1<<31) = 1
+      expect(state.totalCount, 1);
+    });
+
+    test('row.delta appends text', () {
+      _injectSnapshot(state, rows: [
+        {'rowId': 1, 'kind': 'assistantText', 'text': 'Hello'},
+      ]);
+
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'row.delta', 'rowId': 1, 'path': 'text', 'append': ' World'},
+          ],
+        },
+        'fromSeq': 5,
+        'toSeq': 6,
+      }, onGap: () => fail('should not gap'));
+
+      expect(state.rows[0]['text'], 'Hello World');
+    });
+
+    test('row.delta on toolCall inputText', () {
+      _injectSnapshot(state, rows: [
+        {'rowId': 1, 'kind': 'toolCall', 'inputText': 'ls'},
+      ]);
+
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'row.delta', 'rowId': 1, 'path': 'inputText', 'append': ' -la'},
+          ],
+        },
+        'fromSeq': 5,
+        'toSeq': 6,
+      }, onGap: () => fail('should not gap'));
+
+      expect(state.rows[0]['inputText'], 'ls -la');
+    });
+
+    test('row.delta on toolCall output.text merges into nested map', () {
+      _injectSnapshot(state, rows: [
+        {
+          'rowId': 1,
+          'kind': 'toolCall',
+          'output': {'text': 'file1'},
+        },
+      ]);
+
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'row.delta', 'rowId': 1, 'path': 'output.text', 'append': '\nfile2'},
+          ],
+        },
+        'fromSeq': 5,
+        'toSeq': 6,
+      }, onGap: () => fail('should not gap'));
+
+      final output = state.rows[0]['output'] as Map;
+      expect(output['text'], 'file1\nfile2');
+    });
+
+    test('state.updated merges into snapshot', () {
+      _injectSnapshot(state, revision: 5, snapshot: {
+        'control': {'phase': 'idle', 'canStop': false},
+      });
+
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'state.updated', 'patch': {'revision': 6}},
+          ],
+        },
+        'fromSeq': 5,
+        'toSeq': 6,
+      }, onGap: () => fail('should not gap'));
+
+      expect(state.revision, 6);
+      expect(state.phase, 'idle'); // phase lives under control, not top-level
+    });
+
+    test('state.updated before snapshot is buffered', () {
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'state.updated', 'patch': {'revision': 3}},
+          ],
+        },
+        'fromSeq': 0,
+        'toSeq': 1,
+      }, onGap: () => fail('should not gap'));
+
+      // Still pending, snapshot not yet arrived
+      expect(state.revision, 0);
+
+      // Snapshot arrives — buffered patch merges
+      _injectSnapshot(state, revision: 1, seq: 2);
+      expect(state.revision, 3);
+    });
+
+    test('fromSeq mismatch triggers onGap', () {
+      _injectSnapshot(state, seq: 10);
+
+      var gapCalled = false;
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [],
+        },
+        'fromSeq': 5, // mismatch — current seq is 10
+        'toSeq': 11,
+      }, onGap: () => gapCalled = true);
+
+      expect(gapCalled, isTrue);
+      expect(state.seq, 10); // unchanged
+    });
+
+    test('optimisticRowUpdate mutates in place', () {
+      _injectSnapshot(state, rows: [
+        {'rowId': 1, 'kind': 'assistant', 'feedback': null},
+      ]);
+
+      state.optimisticRowUpdate(1, {'feedback': 'like'});
+      expect(state.rows[0]['feedback'], 'like');
+    });
+
+    test('optimisticRemoveQueueItem removes from queue items', () {
+      _injectSnapshot(state, snapshot: {
+        'revision': 1,
+        'rows': {'window': [], 'totalCount': 0},
+        'queue': {
+          'items': [
+            {'queueItemId': 'q1', 'text': 'a'},
+            {'queueItemId': 'q2', 'text': 'b'},
+          ],
+        },
+      });
+
+      state.optimisticRemoveQueueItem('q1');
+      final q = state.queue;
+      final items = q?['items'] as List;
+      expect(items, hasLength(1));
+      expect(items[0]['queueItemId'], 'q2');
+    });
+
+    test('canLoadOlder is true when more rows exist', () {
+      _injectSnapshot(state, rows: [
+        {'rowId': 10, 'kind': 'user', 'text': 'latest'},
+      ], totalCount: 100, firstRowId: 10);
+
+      expect(state.canLoadOlder, isTrue);
+    });
+
+    test('canLoadOlder is false when all rows loaded', () {
+      _injectSnapshot(state, rows: [
+        {'rowId': 1, 'kind': 'user', 'text': 'first'},
+      ], totalCount: 1, firstRowId: 1);
+
+      expect(state.canLoadOlder, isFalse);
+    });
+
+    test('prependOlderRows inserts before existing', () {
+      _injectSnapshot(state, rows: [
+        {'rowId': 3, 'kind': 'assistant', 'text': 'c'},
+      ], totalCount: 3, firstRowId: 3);
+
+      state.prependOlderRows([
+        {'rowId': 1, 'kind': 'user', 'text': 'a'},
+        {'rowId': 2, 'kind': 'assistant', 'text': 'b'},
+      ], 1);
+
+      expect(state.rows, hasLength(3));
+      expect(state.rows[0]['rowId'], 1);
+      expect(state.rows[1]['rowId'], 2);
+      expect(state.rows[2]['rowId'], 3);
+      expect(state.firstRowId, 1);
+    });
+
+    test('prependOlderRows deduplicates by rowId', () {
+      _injectSnapshot(state, rows: [
+        {'rowId': 2, 'kind': 'assistant', 'text': 'existing'},
+      ]);
+
+      state.prependOlderRows([
+        {'rowId': 1, 'kind': 'user', 'text': 'old'},
+        {'rowId': 2, 'kind': 'user', 'text': 'dup'},
+      ], 1);
+
+      expect(state.rows, hasLength(2));
+      expect(state.rows[0]['text'], 'old');
+      expect(state.rows[1]['text'], 'existing');
+    });
+
+    test('computed properties from snapshot', () {
+      _injectSnapshot(state, snapshot: {
+        'revision': 5,
+        'control': {'phase': 'running', 'canStop': true},
+        'config': {'model': 'GLM-5.2', 'thought': 'max', 'mode': 'build'},
+        'usage': {'contextWindow': {'usedTokens': 100, 'maxTokens': 200000}},
+      });
+
+      expect(state.isRunning, isTrue);
+      expect(state.canStop, isTrue);
+      expect(state.currentModel, 'GLM-5.2');
+      expect(state.currentThought, 'max');
+      expect(state.currentMode, 'build');
+      expect(state.usage, isNotNull);
+    });
+
+    test('draft phase is not running', () {
+      _injectSnapshot(state, snapshot: {
+        'revision': 1,
+        'control': {'phase': 'draft'},
+        'rows': {'window': [], 'totalCount': 0},
+      });
+
+      expect(state.isRunning, isFalse);
+      expect(state.canStop, isFalse);
+    });
+    test('rowsVersion and rowId index preserve first-match semantics', () {
+      final initialVersion = state.rowsVersion;
+      state.rows = [
+        {'rowId': 7, 'kind': 'assistantText', 'text': 'first'},
+        {'rowId': 7, 'kind': 'assistantText', 'text': 'second'},
+        {'kind': 'assistantText', 'text': 'null row'},
+      ];
+      expect(state.rowsVersion, greaterThan(initialVersion));
+
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'row.delta', 'rowId': 7, 'path': 'text', 'append': '!'},
+          ],
+        },
+        'fromSeq': state.seq,
+        'toSeq': state.seq + 1,
+      }, onGap: () => fail('should not gap'));
+      expect(state.rows[0]['text'], 'first!');
+      expect(state.rows[1]['text'], 'second');
+
+      state.optimisticRowUpdate(null, {'feedback': 'like'});
+      expect(state.rows[2]['feedback'], 'like');
+
+      state.rows = [
+        {'rowId': 9, 'kind': 'assistantText', 'text': 'replacement'},
+      ];
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'row.upserted', 'row': {'rowId': 9, 'text': 'updated'}},
+          ],
+        },
+        'fromSeq': state.seq,
+        'toSeq': state.seq + 1,
+      }, onGap: () => fail('should not gap'));
+      expect(state.rows.single['text'], 'updated');
+    });
+    test('domain listeners receive selective coalesced notifications', () async {
+      final state = ConversationState();
+      addTearDown(state.dispose);
+      var main = 0;
+      var rows = 0;
+      var control = 0;
+      var config = 0;
+      var usage = 0;
+      var queue = 0;
+      var interaction = 0;
+      var background = 0;
+      state.addListener(() => main++);
+      state.rowsListenable.addListener(() => rows++);
+      state.controlListenable.addListener(() => control++);
+      state.configListenable.addListener(() => config++);
+      state.usageListenable.addListener(() => usage++);
+      state.queueListenable.addListener(() => queue++);
+      state.interactionListenable.addListener(() => interaction++);
+      state.backgroundListenable.addListener(() => background++);
+
+      _injectSnapshot(state, snapshot: {
+        'control': {'phase': 'idle'},
+        'config': {'model': 'm'},
+        'usage': {'contextWindow': {}},
+        'queue': {'items': []},
+        'pendingInteractions': [],
+        'backgroundWorks': [],
+        'rows': {'window': [], 'totalCount': 0},
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      expect(main, 1);
+      expect(rows, 1);
+      expect(control, 1);
+      expect(config, 1);
+      expect(usage, 1);
+      expect(queue, 1);
+      expect(interaction, 1);
+      expect(background, 1);
+
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'state.updated', 'patch': {'usage': null, 'queue': null}},
+          ],
+        },
+        'fromSeq': state.seq,
+        'toSeq': state.seq + 1,
+      }, onGap: () => fail('should not gap'));
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      expect(main, 2);
+      expect(usage, 2);
+      expect(queue, 2);
+      expect(rows, 1);
+      expect(config, 1);
+
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {
+              'op': 'row.appended',
+              'row': {'rowId': 1, 'kind': 'subagent', 'status': 'running'},
+            },
+            {
+              'op': 'row.delta',
+              'rowId': 1,
+              'path': 'summaryText',
+              'append': 'x',
+            },
+          ],
+        },
+        'fromSeq': state.seq,
+        'toSeq': state.seq + 1,
+      }, onGap: () => fail('should not gap'));
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      expect(main, 3);
+      expect(rows, 2);
+      expect(background, 2);
+      expect(config, 1);
+    });
+  });
+
+  group('SessionsIndexState delta application', () {
+    late SessionsIndexState state;
+    late int gapCount;
+
+    void onGap() => gapCount++;
+
+    setUp(() {
+      state = SessionsIndexState();
+      gapCount = 0;
+    });
+
+    test('snapshot loads sessions', () {
+      state.applyFrame({
+        'payload': {
+          'kind': 'snapshot',
+          'snapshot': {
+            'workspaceId': 'ws-1',
+            'logEpoch': 'epoch-1',
+            'sessions': [
+              {
+                'sessionId': 's1',
+                'title': 'Task A',
+                'phase': 'running',
+                'lastActivityAt': 1000,
+                'createdAt': 900,
+              },
+              {
+                'sessionId': 's2',
+                'title': 'Task B',
+                'phase': 'completed',
+                'lastActivityAt': 2000,
+                'createdAt': 800,
+              },
+            ],
+          },
+        },
+        'toSeq': 5,
+      }, onGap: onGap);
+
+      expect(state.sessions, hasLength(2));
+      expect(state.ready, isTrue);
+      expect(state.workspaceId, 'ws-1');
+      expect(gapCount, 0);
+    });
+
+    test('list is sorted by lastActivityAt descending', () {
+      state.applyFrame({
+        'payload': {
+          'kind': 'snapshot',
+          'snapshot': {
+            'sessions': [
+              {'sessionId': 'older', 'lastActivityAt': 100, 'createdAt': 50, 'phase': 'draft', 'title': 'Old'},
+              {'sessionId': 'newer', 'lastActivityAt': 200, 'createdAt': 50, 'phase': 'draft', 'title': 'New'},
+            ],
+          },
+        },
+        'toSeq': 1,
+      }, onGap: onGap);
+
+      final list = state.list;
+      expect(list[0].sessionId, 'newer');
+      expect(list[1].sessionId, 'older');
+    });
+
+    test('list cache reuses same version and invalidates on mutation', () {
+      _injectSessionsSnapshot(state, sessions: [
+        {'sessionId': 'older', 'title': 'Old', 'phase': 'idle', 'lastActivityAt': 100},
+        {'sessionId': 'newer', 'title': 'New', 'phase': 'idle', 'lastActivityAt': 200},
+      ]);
+      final first = state.list;
+      expect(state.list, same(first));
+
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {
+              'op': 'session.upserted',
+              'session': {
+                'sessionId': 'added',
+                'title': 'Added',
+                'phase': 'idle',
+                'lastActivityAt': 150,
+              },
+            },
+          ],
+        },
+        'fromSeq': state.seq,
+        'toSeq': state.seq + 1,
+      }, onGap: onGap);
+      expect(state.list, isNot(same(first)));
+      expect(state.list.map((e) => e.sessionId), ['newer', 'added', 'older']);
+    });
+
+    test('equal activity keeps stable session order across upserts', () {
+      _injectSessionsSnapshot(state, sessions: [
+        {'sessionId': 'first', 'title': 'First', 'phase': 'idle', 'lastActivityAt': 100},
+        {'sessionId': 'second', 'title': 'Second', 'phase': 'idle', 'lastActivityAt': 100},
+      ]);
+      expect(state.list.map((e) => e.sessionId), ['first', 'second']);
+
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {
+              'op': 'session.upserted',
+              'session': {
+                'sessionId': 'second',
+                'title': 'Second updated',
+                'phase': 'idle',
+                'lastActivityAt': 100,
+              },
+            },
+            {
+              'op': 'session.upserted',
+              'session': {
+                'sessionId': 'third',
+                'title': 'Third',
+                'phase': 'idle',
+                'lastActivityAt': 100,
+              },
+            },
+          ],
+        },
+        'fromSeq': state.seq,
+        'toSeq': state.seq + 1,
+      }, onGap: onGap);
+      expect(state.list.map((e) => e.sessionId), ['first', 'second', 'third']);
+    });
+
+    test('list cache invalidates when a session is removed', () {
+      _injectSessionsSnapshot(state, sessions: [
+        {'sessionId': 'first', 'title': 'First', 'phase': 'idle', 'lastActivityAt': 100},
+        {'sessionId': 'second', 'title': 'Second', 'phase': 'idle', 'lastActivityAt': 50},
+      ]);
+      final first = state.list;
+
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'session.removed', 'sessionId': 'first'},
+          ],
+        },
+        'fromSeq': state.seq,
+        'toSeq': state.seq + 1,
+      }, onGap: onGap);
+      expect(state.list, isNot(same(first)));
+      expect(state.list.map((e) => e.sessionId), ['second']);
+    });
+
+    test('session.upserted delta', () {
+      _injectSessionsSnapshot(state);
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {
+              'op': 'session.upserted',
+              'session': {
+                'sessionId': 'new-task',
+                'title': 'Fresh',
+                'phase': 'draft',
+                'lastActivityAt': 500,
+                'createdAt': 400,
+              },
+            },
+          ],
+        },
+        'fromSeq': 1,
+        'toSeq': 2,
+      }, onGap: onGap);
+
+      expect(state.sessions, hasLength(1));
+      expect(state.sessions['new-task']!.title, 'Fresh');
+    });
+
+    test('session.removed delta', () {
+      _injectSessionsSnapshot(state, sessions: [
+        {'sessionId': 's1', 'title': 'T1', 'phase': 'draft', 'lastActivityAt': 0, 'createdAt': 0},
+        {'sessionId': 's2', 'title': 'T2', 'phase': 'draft', 'lastActivityAt': 0, 'createdAt': 0},
+      ]);
+
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'session.removed', 'sessionId': 's1'},
+          ],
+        },
+        'fromSeq': 1,
+        'toSeq': 2,
+      }, onGap: onGap);
+
+      expect(state.sessions, hasLength(1));
+      expect(state.sessions.containsKey('s1'), isFalse);
+      expect(state.sessions.containsKey('s2'), isTrue);
+    });
+
+    test('session entry parses parentSessionId (side chat marker)', () {
+      state.applyFrame({
+        'payload': {
+          'kind': 'snapshot',
+          'snapshot': {
+            'sessions': [
+              {
+                'sessionId': 'side-1',
+                'parentSessionId': 'main-1',
+                'title': 'Side chat',
+                'phase': 'running',
+                'lastActivityAt': 100,
+                'createdAt': 90,
+              },
+              {
+                'sessionId': 'main-1',
+                'title': 'Main task',
+                'phase': 'draft',
+                'lastActivityAt': 200,
+                'createdAt': 50,
+              },
+            ],
+          },
+        },
+        'toSeq': 1,
+      }, onGap: onGap);
+
+      expect(state.sessions['side-1']!.parentSessionId, 'main-1');
+      expect(state.sessions['main-1']!.parentSessionId, isNull);
+    });
+  });
+
+
+  group('arrival stamps (_zflowTs)', () {
+    late ConversationState state;
+
+    setUp(() {
+      state = ConversationState();
+    });
+
+    test('row.appended stamps arrival time', () {
+      _injectSnapshot(state, seq: 1);
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'row.appended', 'row': {'rowId': 7, 'kind': 'userInput', 'text': 'hi'}},
+          ],
+        },
+        'fromSeq': 1,
+        'toSeq': 2,
+      }, onGap: () => fail('no gap'));
+      final ts = state.rows.single['_zflowTs'];
+      expect(ts, isA<int>());
+      expect(ts, greaterThan(0));
+    });
+
+    test('snapshot replacement carries stamps by rowId', () {
+      _injectSnapshot(state, seq: 1);
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'row.appended', 'row': {'rowId': 7, 'kind': 'userInput', 'text': 'hi'}},
+          ],
+        },
+        'fromSeq': 1,
+        'toSeq': 2,
+      }, onGap: () => fail('no gap'));
+      final stamped = state.rows.single['_zflowTs'];
+
+      // Server resyncs with a fresh snapshot containing the same row.
+      state.applyFrame({
+        'payload': {
+          'kind': 'snapshot',
+          'snapshot': {
+            'rows': {
+              'window': [
+                {'rowId': 1, 'kind': 'assistantText', 'text': 'history'},
+                {'rowId': 7, 'kind': 'userInput', 'text': 'hi'},
+              ],
+              'totalCount': 2,
+              'firstRowId': 1,
+            },
+          },
+        },
+        'toSeq': 3,
+      }, onGap: () => fail('no gap'));
+
+      final byId = {for (final r in state.rows) r['rowId']: r};
+      expect(byId[7]!['_zflowTs'], stamped); // carried over
+      expect(byId[1]!.containsKey('_zflowTs'), isFalse); // history unstamped
+    });
+
+    test('resync snapshot keeps rows older than the tail window', () {
+      // Initial tail window + paged-in history below the window head.
+      _injectSnapshot(state, rows: [
+        {'rowId': 50, 'kind': 'userInput', 'text': 'newest'},
+      ], totalCount: 5, firstRowId: 1, seq: 1);
+      state.prependOlderRows([
+        {'rowId': 10, 'kind': 'assistantText', 'text': 'old A'},
+        {'rowId': 20, 'kind': 'assistantText', 'text': 'old B'},
+      ], 10);
+
+      // Reconnect resync delivers a fresh TAIL snapshot; row 20 also
+      // reappears inside the window (updated copy must win).
+      state.applyFrame({
+        'payload': {
+          'kind': 'snapshot',
+          'snapshot': {
+            'rows': {
+              'window': [
+                {'rowId': 20, 'kind': 'assistantText', 'text': 'old B (upsert)'},
+                {'rowId': 50, 'kind': 'userInput', 'text': 'newest'},
+              ],
+              'totalCount': 5,
+              'firstRowId': 1,
+            },
+          },
+        },
+        'toSeq': 9,
+      }, onGap: () => fail('no gap'));
+
+      expect(state.rows.map((r) => r['rowId']), [10, 20, 50]);
+      // The window's copy replaced the stale kept row.
+      expect(
+          state.rows
+              .firstWhere((r) => r['rowId'] == 20)['text'],
+          'old B (upsert)');
+      expect(state.totalCount, 5);
+    });
+
+    test('empty snapshot window clears rows (session reset)', () {
+      _injectSnapshot(state, rows: [
+        {'rowId': 5, 'kind': 'userInput', 'text': 'x'},
+      ], totalCount: 1, firstRowId: 1, seq: 1);
+      state.applyFrame({
+        'payload': {
+          'kind': 'snapshot',
+          'snapshot': {
+            'rows': {'window': [], 'totalCount': 0, 'firstRowId': null},
+          },
+        },
+        'toSeq': 2,
+      }, onGap: () => fail('no gap'));
+      expect(state.rows, isEmpty);
+    });
+
+    test('row.upserted keeps the original stamp', () {
+      _injectSnapshot(state, rows: [
+        {'rowId': 1, 'kind': 'user', 'text': 'old'},
+      ]);
+      // Upsert of an unstamped row must not blow up on typed maps.
+      state.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'row.upserted', 'row': {'rowId': 1, 'kind': 'user', 'text': 'updated'}},
+          ],
+        },
+        'fromSeq': 5,
+        'toSeq': 6,
+      }, onGap: () => fail('no gap'));
+      expect(state.rows.single['text'], 'updated');
+      expect(state.rows.single.containsKey('_zflowTs'), isFalse);
+    });
+  });
+
+  group('history paging to the earliest row', () {
+    late ConversationState state;
+
+    setUp(() {
+      state = ConversationState();
+    });
+
+    /// Mirrors the host's getRowsRange exactly: rows with a SMALLER
+    /// rowId than the cursor, last [limit] of them, plus hasMore.
+    (List<Map<String, dynamic>>, bool) serverRowsRange(
+        int? beforeRowId, int limit) {
+      var pool = List<Map<String, dynamic>>.generate(
+          250, (i) => {'rowId': i + 1, 'kind': 'assistantText', 'text': 'm$i'});
+      if (beforeRowId != null) {
+        pool = pool.where((r) => (r['rowId'] as num) < beforeRowId).toList();
+      }
+      final page =
+          pool.length > limit ? pool.sublist(pool.length - limit) : pool;
+      return (page, pool.length > page.length);
+    }
+
+    test('pages down to the first row of the conversation', () {
+      // Wire snapshot: 60-row tail window, totalCount/firstRowId of the
+      // FULL projection (host semantics).
+      final tail = List<Map<String, dynamic>>.generate(
+          60,
+          (i) =>
+              {'rowId': i + 191, 'kind': 'assistantText', 'text': 'm${i + 190}'});
+      _injectSnapshot(state, rows: tail, totalCount: 250, firstRowId: 1, seq: 1);
+
+      expect(state.canLoadOlder, isTrue, reason: 'totalCount 250 vs 60 rows');
+      // The snapshot's firstRowId is the projection head — the OLD cursor
+      // bug: using it as beforeRowId yields an empty page forever.
+      final (bugged, _) = serverRowsRange(state.firstRowId, 60);
+      expect(bugged, isEmpty,
+          reason: 'projection-head cursor filters everything out');
+
+      // Drive the fixed loop: cursor = oldest held row, until hasMore
+      // says the batch was the last.
+      var guard = 0;
+      while (state.canLoadOlder && guard++ < 10) {
+        final (page, hasMore) = serverRowsRange(state.oldestRowId, 60);
+        state.prependOlderRows(page, null);
+        if (!hasMore) state.historyExhausted = true;
+      }
+
+      expect(state.rows.first['rowId'], 1, reason: 'earliest row reached');
+      expect(state.rows, hasLength(250));
+      expect(state.rows.last['rowId'], 250);
+      expect(state.canLoadOlder, isFalse, reason: 'exhausted retires it');
+      // Rows stay ordered and deduped across pages.
+      for (var i = 0; i < state.rows.length; i++) {
+        expect(state.rows[i]['rowId'], i + 1);
+      }
+    });
+
+    test('resync mid-paging keeps the already-loaded older rows', () {
+      final tail = List<Map<String, dynamic>>.generate(
+          60, (i) => {'rowId': i + 191, 'kind': 'assistantText', 'text': 'm'});
+      _injectSnapshot(state, rows: tail, totalCount: 250, firstRowId: 1, seq: 1);
+      final (page, _) = serverRowsRange(state.oldestRowId, 60);
+      state.prependOlderRows(page, null);
+      expect(state.rows.first['rowId'], 131);
+
+      // Reconnect resync: fresh tail window (two new rows arrived).
+      _injectSnapshot(state,
+          rows: List<Map<String, dynamic>>.generate(
+              60, (i) => {'rowId': i + 193, 'kind': 'assistantText', 'text': 'm'}),
+          totalCount: 252,
+          firstRowId: 1,
+          seq: 5);
+
+      expect(state.rows.first['rowId'], 131, reason: 'paged-in history kept');
+      expect(state.rows.last['rowId'], 252);
+      // The cursor still advances from the kept head.
+      expect(state.oldestRowId, 131);
+      expect(state.canLoadOlder, isTrue);
+    });
+
+    test('oldestRowId falls back to firstRowId on an empty row list', () {
+      _injectSnapshot(state,
+          rows: const [], totalCount: 10, firstRowId: 3, seq: 1);
+      expect(state.oldestRowId, 3);
+    });
+  });
+
+  test('a timed-out retry shares the late in-flight subscription', () async {
+    final sent = <Uint8List>[];
+    final channels = ChannelClient(sendBody: sent.add);
+    final bridge = BridgeSession.detached(
+      {'workspaceKey': '/ws'},
+      channels: channels,
+    );
+    final transport = ConversationTransport(
+      session: bridge,
+      scope: const {'workspacePath': '/ws'},
+    );
+    addTearDown(() {
+      transport.dispose();
+      bridge.dispose();
+    });
+    channels.handleMessage(
+        _conversationFrame(const [ChannelClient.resInitialize, 0]));
+
+    final lateFuture = transport.subscribe('session-1');
+    await _flushConversation();
+    var requests = sent.map(_conversationRequest).toList();
+    final hello =
+        requests.singleWhere((r) => r.method == 'helloConversationV4');
+    _respondConversation(channels, hello.id, <String, dynamic>{});
+    await _flushConversation();
+    requests = sent.map(_conversationRequest).toList();
+    final initialize =
+        requests.singleWhere((r) => r.method == 'initializeConversationV4');
+    _respondConversation(channels, initialize.id, <String, dynamic>{});
+    await _flushConversation();
+
+    requests = sent.map(_conversationRequest).toList();
+    final subscribeRequests = requests
+        .where((r) => r.method == 'subscribeConversationV4')
+        .toList();
+    expect(subscribeRequests, hasLength(1));
+
+    await expectLater(
+      lateFuture.timeout(Duration.zero),
+      throwsA(isA<TimeoutException>()),
+    );
+
+    final retryFuture = transport.subscribe('session-1');
+    await _flushConversation();
+    requests = sent.map(_conversationRequest).toList();
+    expect(
+      requests.where((r) => r.method == 'subscribeConversationV4'),
+      hasLength(1),
+    );
+    _respondConversation(channels, subscribeRequests.single.id, {
+      'ack': {'subscriptionId': 'shared-sub'},
+    });
+
+    final late = await lateFuture;
+    final retry = await retryFuture;
+    expect(retry, same(late));
+
+    final disposeFuture = retry.dispose();
+    await _flushConversation();
+    requests = sent.map(_conversationRequest).toList();
+    final unsubscribe =
+        requests.singleWhere((r) => r.method == 'unsubscribeConversationV4');
+    _respondConversation(channels, unsubscribe.id, <String, dynamic>{});
+    await disposeFuture;
+  });
+
+  test('a failed in-flight subscribe can be retried', () async {
+    final sent = <Uint8List>[];
+    final channels = ChannelClient(sendBody: sent.add);
+    final bridge = BridgeSession.detached(
+      {'workspaceKey': '/ws'},
+      channels: channels,
+    );
+    final transport = ConversationTransport(
+      session: bridge,
+      scope: const {'workspacePath': '/ws'},
+    );
+    addTearDown(() {
+      transport.dispose();
+      bridge.dispose();
+    });
+    channels.handleMessage(
+        _conversationFrame(const [ChannelClient.resInitialize, 0]));
+
+    final failedFuture = transport.subscribe('session-1');
+    await _flushConversation();
+    var requests = sent.map(_conversationRequest).toList();
+    final hello =
+        requests.singleWhere((r) => r.method == 'helloConversationV4');
+    _respondConversation(channels, hello.id, <String, dynamic>{});
+    await _flushConversation();
+    requests = sent.map(_conversationRequest).toList();
+    final initialize =
+        requests.singleWhere((r) => r.method == 'initializeConversationV4');
+    _respondConversation(channels, initialize.id, <String, dynamic>{});
+    await _flushConversation();
+    requests = sent.map(_conversationRequest).toList();
+    final firstSubscribe =
+        requests.singleWhere((r) => r.method == 'subscribeConversationV4');
+    _rejectConversation(channels, firstSubscribe.id, {'message': 'rejected'});
+    await expectLater(failedFuture, throwsA(isA<ChannelRpcError>()));
+
+    final retryFuture = transport.subscribe('session-1');
+    await _flushConversation();
+    requests = sent.map(_conversationRequest).toList();
+    final subscribeRequests = requests
+        .where((r) => r.method == 'subscribeConversationV4')
+        .toList();
+    expect(subscribeRequests, hasLength(2));
+    _respondConversation(channels, subscribeRequests.last.id, {
+      'ack': {'subscriptionId': 'retry-sub'},
+    });
+    final retry = await retryFuture;
+    expect(retry.subscriptionId, 'retry-sub');
+    final disposeFuture = retry.dispose();
+    await _flushConversation();
+    requests = sent.map(_conversationRequest).toList();
+    final unsubscribe =
+        requests.singleWhere((r) => r.method == 'unsubscribeConversationV4');
+    _respondConversation(channels, unsubscribe.id, <String, dynamic>{});
+    await disposeFuture;
+  });
+
+  test('disposing an old subscription preserves the replacement mapping', () async {
+    final sent = <Uint8List>[];
+    final channels = ChannelClient(sendBody: sent.add);
+    final bridge = BridgeSession.detached(
+      {'workspaceKey': '/ws'},
+      channels: channels,
+    );
+    final transport = ConversationTransport(
+      session: bridge,
+      scope: const {'workspacePath': '/ws'},
+    );
+    addTearDown(() {
+      transport.dispose();
+      bridge.dispose();
+    });
+    channels.handleMessage(
+        _conversationFrame(const [ChannelClient.resInitialize, 0]));
+
+    final oldFuture = transport.subscribe('session-1');
+    await _flushConversation();
+
+    var requests = sent.map(_conversationRequest).toList();
+    final hello =
+        requests.singleWhere((r) => r.method == 'helloConversationV4');
+    _respondConversation(channels, hello.id, <String, dynamic>{});
+    await _flushConversation();
+    requests = sent.map(_conversationRequest).toList();
+    final initialize =
+        requests.singleWhere((r) => r.method == 'initializeConversationV4');
+    _respondConversation(channels, initialize.id, <String, dynamic>{});
+    await _flushConversation();
+
+    requests = sent.map(_conversationRequest).toList();
+    final oldSubscribe = requests
+        .singleWhere((r) => r.method == 'subscribeConversationV4');
+    _respondConversation(channels, oldSubscribe.id, {
+      'ack': {'subscriptionId': 'old-sub'},
+    });
+    final old = await oldFuture;
+
+    final replacementFuture = transport.subscribe('session-1');
+    await _flushConversation();
+    requests = sent.map(_conversationRequest).toList();
+    final replacementSubscribe = requests
+        .where((r) => r.method == 'subscribeConversationV4')
+        .last;
+    _respondConversation(channels, replacementSubscribe.id, {
+      'ack': {'subscriptionId': 'replacement-sub'},
+    });
+
+    final replacement = await replacementFuture;
+    replacement.state.applyFrame({
+      'payload': {
+        'kind': 'snapshot',
+        'snapshot': {
+          'revision': 17,
+          'logEpoch': 'epoch-replacement',
+          'rows': {'window': [], 'totalCount': 0},
+        },
+      },
+      'toSeq': 1,
+    }, onGap: () => fail('replacement snapshot should not gap'));
+
+    final oldDispose = old.dispose();
+    await _flushConversation();
+    requests = sent.map(_conversationRequest).toList();
+    final oldUnsubscribe = requests.singleWhere(
+      (r) => r.method == 'unsubscribeConversationV4',
+    );
+    _respondConversation(channels, oldUnsubscribe.id, <String, dynamic>{});
+    await oldDispose;
+
+    final commandFuture = transport.sendCommand(
+      'session-1',
+      'setAssistantFeedback',
+      {'rowId': 1, 'feedback': 'like'},
+    );
+    await _flushConversation();
+    requests = sent.map(_conversationRequest).toList();
+    final command = requests.singleWhere(
+      (r) => r.method == 'sendConversationCommandV4',
+    );
+    final envelope = ((command.args as List).single as Map)['envelope'] as Map;
+    expect(envelope['baseRevision'], 17);
+    expect(envelope['baseLogEpoch'], 'epoch-replacement');
+    _respondConversation(channels, command.id, {
+      'status': 'accepted',
+      'revisionAtDecision': 17,
+    });
+    await commandFuture;
+  });
+
+  group('parked subscriptions (切会话保活)', () {
+    test('park 后取回同一实例，切回零握手', () async {
+      final sent = <Uint8List>[];
+      final channels = ChannelClient(sendBody: sent.add);
+      final bridge = BridgeSession.detached(
+        {'workspaceKey': '/ws'},
+        channels: channels,
+      );
+      final transport = ConversationTransport(
+        session: bridge,
+        scope: const {'workspacePath': '/ws'},
+      );
+      addTearDown(() {
+        transport.dispose();
+        bridge.dispose();
+      });
+      channels.handleMessage(
+          _conversationFrame(const [ChannelClient.resInitialize, 0]));
+
+      final sub = await _subscribed(
+          channels, sent, transport, 'session-1', 'park-sub-1');
+      final before = sent.length;
+      transport.parkSubscription(sub);
+      final parked = transport.takeParkedSubscription('session-1');
+      expect(parked, same(sub), reason: '驻留取回应是同一实例');
+      expect(parked?.state, same(sub.state), reason: 'state(行缓存)保持最新');
+      expect(sent.length, before, reason: '驻留/取回不产生任何 wire 流量');
+      await _drainConversation(channels, sent);
+    });
+
+    test('tracked 身份被替换后驻留副本失效并断开', () async {
+      final sent = <Uint8List>[];
+      final channels = ChannelClient(sendBody: sent.add);
+      final bridge = BridgeSession.detached(
+        {'workspaceKey': '/ws'},
+        channels: channels,
+      );
+      final transport = ConversationTransport(
+        session: bridge,
+        scope: const {'workspacePath': '/ws'},
+      );
+      addTearDown(() {
+        transport.dispose();
+        bridge.dispose();
+      });
+      channels.handleMessage(
+          _conversationFrame(const [ChannelClient.resInitialize, 0]));
+
+      final old = await _subscribed(
+          channels, sent, transport, 'session-1', 'park-old');
+      transport.parkSubscription(old);
+
+      // 同会话新订阅（模拟恢复流程的替换）→ tracked 身份变化。
+      final replacement = await _subscribed(
+          channels, sent, transport, 'session-1', 'park-new');
+      expect(identical(replacement, old), isFalse);
+
+      expect(transport.takeParkedSubscription('session-1'), isNull,
+          reason: '驻留副本已失效');
+      final disposalSent = sent.length;
+      await _flushConversation();
+      await _drainConversation(channels, sent);
+      expect(sent.length, greaterThan(disposalSent - 1),
+          reason: '失效副本的断开流量已发出');
+    });
+
+    test('超过池上限(8)淘汰最旧驻留并断开', () async {
+      final sent = <Uint8List>[];
+      final channels = ChannelClient(sendBody: sent.add);
+      final bridge = BridgeSession.detached(
+        {'workspaceKey': '/ws'},
+        channels: channels,
+      );
+      final transport = ConversationTransport(
+        session: bridge,
+        scope: const {'workspacePath': '/ws'},
+      );
+      addTearDown(() {
+        transport.dispose();
+        bridge.dispose();
+      });
+      channels.handleMessage(
+          _conversationFrame(const [ChannelClient.resInitialize, 0]));
+
+      final first = await _subscribed(
+          channels, sent, transport, 'session-1', 'park-evict-1');
+      transport.parkSubscription(first);
+      final firstUnsubIndex = sent.length;
+
+      // 再驻留 8 个 → 共 9 个,超出上限 8,最旧(session-1)被淘汰。
+      for (var i = 2; i <= 9; i++) {
+        final sub = await _subscribed(
+            channels, sent, transport, 'session-$i', 'park-evict-$i');
+        transport.parkSubscription(sub);
+      }
+
+      await _flushConversation();
+      expect(
+        sent.map(_conversationRequest).toList().reversed.any(
+              (r) => r.method == 'unsubscribeConversationV4',
+            ),
+        isTrue,
+        reason: '淘汰即断开',
+      );
+      expect(firstUnsubIndex, lessThan(sent.length));
+      await _drainConversation(channels, sent);
+    });
+  });
+}
+
+
+void _injectSnapshot(
+  ConversationState state, {
+  int seq = 5,
+  int revision = 1,
+  List<Map<String, dynamic>>? rows,
+  int totalCount = 0,
+  int? firstRowId,
+  Map<String, dynamic>? snapshot,
+}) {
+  final snap = {
+    'revision': revision,
+    'rows': {
+      'window': rows ?? [],
+      'totalCount': totalCount,
+      'firstRowId': ?firstRowId,
+    },
+    ...?snapshot,
+  };
+  state.applyFrame({
+    'payload': {'kind': 'snapshot', 'snapshot': snap},
+    'toSeq': seq,
+  }, onGap: () => fail('unexpected gap'));
+}
+
+void _injectSessionsSnapshot(
+  SessionsIndexState state, {
+  List<Map<String, dynamic>>? sessions,
+}) {
+  final list = sessions ?? [];
+  state.applyFrame({
+    'payload': {
+      'kind': 'snapshot',
+      'snapshot': {'sessions': list},
+    },
+    'toSeq': 1,
+  }, onGap: () => fail('unexpected gap'));
+}
+
+// ------------------------------------------------- parked subscriptions
+
+/// 应答当前全部未应答的 promise 帧（重复应答幂等），冲掉 RPC 超时定时器。
+Future<void> _drainConversation(
+    ChannelClient channels, List<Uint8List> sent) async {
+  for (var round = 0; round < 4; round++) {
+    final before = sent.length;
+    for (final body in sent) {
+      final reader = ValueReader(body);
+      final header = decodeValue(reader) as List;
+      if (header[0] == ChannelClient.reqPromise) {
+        _respondConversation(
+            channels, (header[1] as num).toInt(), <String, dynamic>{});
+      }
+    }
+    await _flushConversation();
+    if (sent.length == before) return;
+  }
+}
+
+/// 完成一次会话订阅握手，返回订阅。
+Future<ConversationSubscription> _subscribed(
+  ChannelClient channels,
+  List<Uint8List> sent,
+  ConversationTransport transport,
+  String sessionId,
+  String subId,
+) async {
+  final future = transport.subscribe(sessionId);
+  await _flushConversation();
+  var requests = sent.map(_conversationRequest).toList();
+  final hello = requests.singleWhere((r) => r.method == 'helloConversationV4');
+  _respondConversation(channels, hello.id, <String, dynamic>{});
+  await _flushConversation();
+  requests = sent.map(_conversationRequest).toList();
+  final initialize =
+      requests.singleWhere((r) => r.method == 'initializeConversationV4');
+  _respondConversation(channels, initialize.id, <String, dynamic>{});
+  await _flushConversation();
+  requests = sent.map(_conversationRequest).toList();
+  final subscribe = requests
+      .where((r) =>
+          r.method == 'subscribeConversationV4' &&
+          r.id > (hello.id > initialize.id ? hello.id : initialize.id))
+      .toList();
+  _respondConversation(channels, subscribe.last.id, {
+    'ack': {'subscriptionId': subId},
+  });
+  return future;
+}

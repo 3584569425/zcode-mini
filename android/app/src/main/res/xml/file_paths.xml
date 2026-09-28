@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Internal update dir — the only path the installer ever needs
+         (see MainActivity.kt apkDir()). Kept to a single subdir so the
+         FileProvider grants nothing beyond the downloaded APK. -->
+    <files-path name="update" path="update/"/>
+</paths>

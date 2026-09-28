@@ -1,0 +1,122 @@
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'protocol/relay_client.dart';
+import 'state/account_store.dart';
+import 'state/app_session.dart';
+import 'state/crash_report.dart';
+import 'state/log_store.dart';
+import 'ui/root_shell.dart';
+import 'ui/theme.dart';
+import 'ui/ui_settings.dart';
+import 'notifications/keep_alive.dart';
+import 'notifications/notifications.dart';
+import 'state/background_prefs.dart';
+
+final navigatorKey = GlobalKey<NavigatorState>();
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Verbose per-frame relay logging: debug default, release reads the
+  // toggle persisted by 设置 → 协议帧日志（详细）.
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    RelayClient.verboseFrames =
+        prefs.getBool('relayVerboseFrames') ?? kDebugMode;
+  } catch (_) {
+    RelayClient.verboseFrames = kDebugMode;
+  }
+  // Crash evidence: persist the last framework/uncaught error so it
+  // survives the process and can be inspected on the next launch.
+  if (!kIsWeb) {
+    try {
+      final dir = await getApplicationSupportDirectory();
+      final store = CrashStore(File('${dir.path}/last_crash.json'));
+      crashStore = store;
+      installCrashHandlers(store);
+      final last = await store.read();
+      if (last != null) {
+        log('[诊断] 检测到上次异常退出（${last.kind} · ${last.error.split('\n').first}）— '
+            '详情见 设置 → 上次崩溃');
+      }
+    } catch (_) {
+      // Crash evidence is best-effort; never block startup.
+    }
+  }
+  runApp(const ZflowApp());
+}
+
+class ZflowApp extends StatefulWidget {
+  const ZflowApp({super.key});
+
+  @override
+  State<ZflowApp> createState() => _ZflowAppState();
+}
+
+class _ZflowAppState extends State<ZflowApp> {
+  final AccountStore _store = AccountStore();
+  final AppSession _session = AppSession();
+  final ThemeController _theme = ThemeController();
+  final UiSettings _uiSettings = UiSettings();
+  KeepAliveController? _keepAlive;
+
+  @override
+  void initState() {
+    super.initState();
+    notificationsService.init();
+    // 配对设备启动即加载:否则冷启动后设备选择器为空,要进一次设备
+    // 管理页才会出现(RootShell 监听 store,加载完成会自行刷新)。
+    _store.load();
+    _theme.load();
+    _uiSettings.load();
+    loadDiagLogPref();
+    // 后台保活(设置 → 后台与通知):偏好/设备列表/回前台都会重新对齐
+    // 前台服务。非 Android 平台为 no-op。
+    BackgroundPrefs.instance.load();
+    _keepAlive = KeepAliveController(
+      store: _store,
+      prefs: BackgroundPrefs.instance,
+      notifications: notificationsService,
+    )..start();
+    // 定制版:不检查上游 zflow 仓库更新(更新走我们自己的发布渠道)
+  }
+
+  @override
+  void dispose() {
+    _keepAlive?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ThemeControllerProvider(
+      controller: _theme,
+      child: UiSettingsProvider(
+        settings: _uiSettings,
+        child: AnimatedBuilder(
+          animation: Listenable.merge([_theme, _uiSettings]),
+          builder: (context, _) => MaterialApp(
+            title: 'Zcode mini',
+            debugShowCheckedModeBanner: false,
+            navigatorKey: navigatorKey,
+            theme: buildLightTheme(),
+            darkTheme: buildDarkTheme(),
+            themeMode: _theme.mode,
+            home: RootShell(store: _store, session: _session),
+            builder: (context, child) => MediaQuery(
+              data: MediaQuery.of(context).copyWith(
+                textScaler:
+                    TextScaler.linear(_uiSettings.textScale),
+              ),
+              child: child ?? const SizedBox.shrink(),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
